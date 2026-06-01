@@ -1,3 +1,5 @@
+<!-- DEV-REFERENCE ONLY — 未被 SKILL.md 加载（孤儿）。其 live 内容已被 seo-rules.md / visual-prompts.md / converter 覆盖。本轮仅标注不删，删除前需确认无外部调用。 -->
+
 # 微信公众号合规与SEO规范
 
 ## 合规红线（违反可能封号）
