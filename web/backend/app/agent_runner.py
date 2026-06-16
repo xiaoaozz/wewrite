@@ -83,6 +83,37 @@ def _summarize_tool_input(name: str, tool_input: dict) -> str:
     return ""
 
 
+async def _consume_stream(message_iter, job) -> str:
+    """消费 Agent SDK 流，emit 事件，返回最后一段 assistant 文本。"""
+    last_text = ""
+    async for message in message_iter:
+        if isinstance(message, SystemMessage):
+            continue
+        if isinstance(message, AssistantMessage):
+            for block in message.content:
+                if isinstance(block, TextBlock):
+                    text = block.text.strip()
+                    if text:
+                        last_text = text
+                        job.emit({"type": "assistant_text", "text": text})
+                elif isinstance(block, ToolUseBlock):
+                    job.emit({"type": "tool_use", "name": block.name,
+                              "detail": _summarize_tool_input(block.name, block.input or {})})
+                elif isinstance(block, ThinkingBlock):
+                    continue
+        elif isinstance(message, UserMessage):
+            for block in message.content:
+                if isinstance(block, ToolResultBlock):
+                    job.emit({"type": "tool_result", "is_error": bool(block.is_error)})
+        elif isinstance(message, ResultMessage):
+            job.completion = _detect_completion(last_text, getattr(message, "result", None))
+            job.emit({"type": "result_meta", "completion": job.completion,
+                      "num_turns": getattr(message, "num_turns", None),
+                      "total_cost_usd": getattr(message, "total_cost_usd", None),
+                      "is_error": getattr(message, "is_error", False)})
+    return last_text
+
+
 async def run_job(job: Job) -> None:
     settings = get_settings()
     from .store import STORE
@@ -118,38 +149,8 @@ async def run_job(job: Job) -> None:
             setting_sources=None,
         )
 
-        last_text = ""
-        async for message in query(prompt=_build_prompt(job, publish=publish), options=options):
-            if isinstance(message, SystemMessage):
-                continue
-            if isinstance(message, AssistantMessage):
-                for block in message.content:
-                    if isinstance(block, TextBlock):
-                        text = block.text.strip()
-                        if text:
-                            last_text = text
-                            job.emit({"type": "assistant_text", "text": text})
-                    elif isinstance(block, ToolUseBlock):
-                        job.emit({
-                            "type": "tool_use",
-                            "name": block.name,
-                            "detail": _summarize_tool_input(block.name, block.input or {}),
-                        })
-                    elif isinstance(block, ThinkingBlock):
-                        continue
-            elif isinstance(message, UserMessage):
-                for block in message.content:
-                    if isinstance(block, ToolResultBlock):
-                        job.emit({"type": "tool_result", "is_error": bool(block.is_error)})
-            elif isinstance(message, ResultMessage):
-                job.completion = _detect_completion(last_text, getattr(message, "result", None))
-                job.emit({
-                    "type": "result_meta",
-                    "completion": job.completion,
-                    "num_turns": getattr(message, "num_turns", None),
-                    "total_cost_usd": getattr(message, "total_cost_usd", None),
-                    "is_error": getattr(message, "is_error", False),
-                })
+        last_text = await _consume_stream(
+            query(prompt=_build_prompt(job, publish=publish), options=options), job)
 
         _collect_outputs(job, ws, theme=theme)
         job.status = "done"
@@ -383,3 +384,98 @@ def _collect_platform_versions(job, ws: Path, source_md: str, profiles: list) ->
         }
         versions.append(v)
     return versions
+
+
+from .platforms import MAX_REWRITE_RETRIES, get_profile
+
+
+def _distribute_system_prompt(settings: Settings, profiles: list) -> dict:
+    guide = (settings.skill_dir / "references" / "multiplatform-rewrite.md").read_text(encoding="utf-8")
+    briefs = "\n\n".join(
+        f"### 平台：{p.label}（id={p.id}）\n"
+        f"- 产出文件：output/{p.output_filename}\n"
+        f"- 形态：{p.output_kind}；需配图：{p.needs_images}\n"
+        f"- 规范：\n{p.rewrite_brief}"
+        for p in profiles
+    )
+    body = (
+        "你是 WeWrite 的多平台改写引擎。把 `output/source.md` 的源内容改写成下列各平台的适配版本。\n\n"
+        f"{guide}\n\n## 本次目标平台\n{briefs}\n\n"
+        "- 用户看不到你的中间思考，进度用简短一行行文本表达。\n"
+        f"- 每个平台版本写完后跑质量门自查，不过则重写，最多重试 {MAX_REWRITE_RETRIES} 次。"
+    )
+    return {"type": "preset", "preset": "claude_code", "append": body}
+
+
+def _distribute_prompt(profiles: list) -> str:
+    names = "、".join(p.label for p in profiles)
+    files = "、".join(f"output/{p.output_filename}" for p in profiles)
+    return (
+        f"请把 output/source.md 改写为：{names}。\n"
+        f"分别保存到：{files}。每进入一个平台输出一行 `[改写] 平台名` 的进度。\n"
+        "严格遵守原创铁律（内容级真改、与源和彼此都拉开差异）与各平台规范，"
+        "并对每个版本跑 humanness_score.py 与 similarity_check.py 自查。"
+    )
+
+
+async def run_distribute_job(job: Job) -> None:
+    settings = get_settings()
+    from .store import STORE
+
+    account = STORE.account(job.user_id)
+    theme = job.theme or account.theme
+    persona = job.persona or account.writing_persona
+    profiles = [p for p in (get_profile(pid) for pid in job.target_platforms) if p]
+
+    job.status = "running"
+    job.emit({"type": "status", "status": "running"})
+    if not profiles:
+        job.status = "error"
+        job.error = "无有效目标平台"
+        job.emit({"type": "status", "status": "error", "error": job.error})
+        job.finish()
+        return
+
+    ws: Optional[Path] = None
+    try:
+        ws = build_workspace(settings, account, theme=theme, persona=persona)
+        (ws / "output").mkdir(exist_ok=True)
+        (ws / "output" / "source.md").write_text(job.source_markdown, encoding="utf-8")
+        _seed_source_images(job, ws)
+        job.emit({"type": "log",
+                  "text": f"改写工作区就绪，目标：{'、'.join(p.label for p in profiles)}"})
+
+        env = {**os.environ, **agent_env(settings, account, theme=theme)}
+        options = ClaudeAgentOptions(
+            system_prompt=_distribute_system_prompt(settings, profiles),
+            allowed_tools=ALLOWED_TOOLS, permission_mode="bypassPermissions",
+            model=settings.model, cwd=str(ws), env=env,
+            max_turns=settings.max_turns, setting_sources=None,
+        )
+        await _consume_stream(query(prompt=_distribute_prompt(profiles), options=options), job)
+
+        # 收集前先把源图片持久化（供小红书复用）
+        _persist_images(job, ws / "output")
+        job.platform_versions = _collect_platform_versions(job, ws, job.source_markdown, profiles)
+        job.status = "done"
+        job.emit({"type": "status", "status": "done",
+                  "versions": [{"platform": v["platform"], "status": v["status"],
+                                "passed": v.get("passed")} for v in job.platform_versions]})
+    except Exception as exc:  # noqa: BLE001
+        job.status = "error"
+        job.error = f"{type(exc).__name__}: {exc}"
+        job.emit({"type": "status", "status": "error", "error": job.error})
+    finally:
+        cleanup_workspace(ws)
+        job.finish()
+
+
+def _seed_source_images(job: Job, ws: Path) -> None:
+    """把内联源（generate job）已持久化的图片拷进改写工作区 output/，供小红书复用。"""
+    for p in getattr(job, "_source_image_paths", []) or []:
+        src = Path(p)
+        if src.is_file():
+            try:
+                shutil.copy2(src, ws / "output" / src.name)
+            except OSError:
+                continue
