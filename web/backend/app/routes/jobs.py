@@ -22,6 +22,7 @@ def _summary(job: Job) -> JobSummary:
         prompt=job.prompt,
         created_at=job.created_at,
         completion=job.completion,
+        kind=job.kind,
     )
 
 
@@ -58,6 +59,7 @@ def get_job(job_id: str, user_id: str = Depends(current_user)) -> dict:
         "preview_html": job.preview_html,
         "images": job.images,
         "events": job.events,
+        "platform_versions": job.platform_versions,
     }
 
 

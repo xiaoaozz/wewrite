@@ -6,7 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from .config import get_settings
-from .routes import account, catalog, jobs, publish
+from .routes import account, catalog, distribute, jobs, publish
 
 app = FastAPI(title="WeWrite Web", version="0.1.0")
 
@@ -27,6 +27,7 @@ app.include_router(catalog.router)
 app.include_router(account.router)
 app.include_router(jobs.router)
 app.include_router(publish.router)
+app.include_router(distribute.router)
 
 
 @app.get("/api/health")

@@ -51,6 +51,7 @@ class JobSummary(BaseModel):
     prompt: str
     created_at: float
     completion: Optional[str] = None  # DONE / DONE_WITH_CONCERNS / BLOCKED / NEEDS_CONTEXT
+    kind: str = "generate"
 
 
 class CatalogItem(BaseModel):

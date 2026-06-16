@@ -68,3 +68,10 @@ def themes() -> list[CatalogItem]:
             tid = p.stem
             items.append(CatalogItem(id=tid, label=tid, description=_THEME_GROUPS.get(tid, "")))
     return items
+
+
+@router.get("/platforms", response_model=list[CatalogItem])
+def platforms() -> list[CatalogItem]:
+    from ..platforms import all_profiles
+    return [CatalogItem(id=p.id, label=p.label, description=p.output_kind)
+            for p in all_profiles().values()]
